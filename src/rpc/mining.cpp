@@ -779,135 +779,236 @@ CKeyID GetAuxpowMiningKey()
     return result;
 }
 
-UniValue getauxblock(const JSONRPCRequest& request)
-{
-    if (request.fHelp || (request.params.size() != 0 && request.params.size() != 2))
-        throw std::runtime_error(
-                "getauxblock <hash> <auxpow>\n"
-                        " create a new block\n"
-                        "If <hash>, <auxpow> is not specified, returns a new block hash.\n"
-                        "If <hash>, <auxpow> is specified, tries to solve the block based on\n"
-                        "the aux proof of work and returns true if it was successful."
-                + HelpExampleCli("getauxblock", "\"myhash\" \"auxpow\"")
-                + HelpExampleRpc("getauxblock", "\"myhash\" \"auxpow\"")
-        );
+/* ************************************************************************** */
+/* Merge mining.  */
 
+/* The variables below are used to keep track of created and not yet
+       submitted auxpow blocks.  Lock them to be sure even for multiple
+       RPC threads running in parallel.  */
+static std::map<uint256, CBlock*> mapNewBlock;
+static std::vector< std::unique_ptr<CBlockTemplate> > vNewBlockTemplate;
+
+static 
+void AuxMiningCheck()
+{
     if (g_connman->GetNodeCount(CConnman::CONNECTIONS_ALL) == 0)
         throw JSONRPCError(-9, "Viacoin is not connected!");
 
     if (IsInitialBlockDownload())
-        throw JSONRPCError(-10, "Viacoin is downloading blocks...");
+        throw JSONRPCError(-10, "Unobtanium is downloading blocks...");
+}
 
-    static std::map<uint256, CBlock*> mapNewBlock;
-    static std::vector< std::unique_ptr<CBlockTemplate> > vNewBlockTemplate;
+static 
+UniValue CreateAuxBlock(const CScript& scriptPubKey)
+{
+    AuxMiningCheck();
+
+    /* Create a new block */
+    static unsigned nTransactionsUpdatedLast;
+    static CBlockIndex* pindexPrev = NULL;
+    static uint64_t nStart;
+    static CBlock* pblock = NULL;
+    static std::unique_ptr<CBlockTemplate> pblocktemplate; 
     const Consensus::Params& consensusParams = Params().GetConsensus();
 
     LOCK(cs_main);
 
-    if (request.params.size() == 0)
+    if (chainActive.Tip()->nHeight < consensusParams.nAuxPowStartHeight - 1)
+        throw JSONRPCError(-1, "Merged mining not enabled at current block height yet");
+
+    // Update block
     {
-        // Update block
-        static unsigned int nTransactionsUpdatedLast;
-        static CBlockIndex* pindexPrev;
-        static uint64_t nStart;
-        static CBlock* pblock;
-        static std::unique_ptr<CBlockTemplate> pblocktemplate;
-
-        if (chainActive.Tip()->nHeight < consensusParams.nAuxPowStartHeight - 1)
-            throw JSONRPCError(-1, "Merged mining not enabled at current block height yet");
-        if (pindexPrev != chainActive.Tip() ||
-            (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && GetTime() - nStart > 20))
+    if (pindexPrev != chainActive.Tip() ||
+            (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && 
+                GetTime() - nStart > 20))
+    {
+        if (pindexPrev != chainActive.Tip())
         {
-            if (pindexPrev != chainActive.Tip())
-            {
-                // Deallocate old blocks since they're obsolete now
-                mapNewBlock.clear();
-                for (auto&& pnblocktemplate : vNewBlockTemplate)
+            // Clear old blocks since they're obsolete now.
+            mapNewBlock.clear();
+            for (auto&& pnblocktemplate : vNewBlockTemplate)
                     pnblocktemplate = nullptr;
-                vNewBlockTemplate.clear();
-            }
-            nTransactionsUpdatedLast = mempool.GetTransactionsUpdated();
-            pindexPrev = chainActive.Tip();
-            nStart = static_cast<uint64_t>(GetTime());
-
-            static const CKeyID keyID = GetAuxpowMiningKey();
-
-            // Create new block with nonce = 0 and extraNonce = 1
-            CScript scriptCoinbase = GetScriptForDestination(keyID);
-            pblocktemplate = BlockAssembler(Params()).CreateNewBlock(scriptCoinbase);
-            if (!pblocktemplate)
-                throw JSONRPCError(-7, "Out of memory");
-
-            pblock = &pblocktemplate->block;
-            // Update nTime
-            pblock->nTime = (uint32_t) std::max(pindexPrev->GetMedianTimePast() + 1, GetAdjustedTime());
-            pblock->nNonce = 0;
-
-            // Update nExtraNonce
-            static unsigned int nExtraNonce = 0;
-            IncrementExtraNonce(pblock, pindexPrev, nExtraNonce);
-
-            // Sets the version
-            pblock->SetAuxPow(new CAuxPow());
-
-            // Save
-            mapNewBlock[pblock->GetHash()] = pblock;
-
-            vNewBlockTemplate.push_back(std::move(pblocktemplate));
+            vNewBlockTemplate.clear();
         }
 
-        bool fNegative, fOverflow;
-        arith_uint256 hashTarget = arith_uint256().SetCompact(pblock->nBits, &fNegative, &fOverflow);
-        if (hashTarget == 0 || fNegative || fOverflow)
+
+        nTransactionsUpdatedLast = mempool.GetTransactionsUpdated();
+        pindexPrev = chainActive.Tip();
+        nStart = static_cast<uint64_t>(GetTime());
+
+
+        pblocktemplate = BlockAssembler(Params()).CreateNewBlock(scriptPubKey);
+        if (!pblocktemplate)
+            throw JSONRPCError(-7, "Out of memory");
+
+        pblock = &pblocktemplate->block;
+            // Update nTime
+        pblock->nTime = (uint32_t) std::max(pindexPrev->GetMedianTimePast() + 1, GetAdjustedTime());
+        pblock->nNonce = 0;
+
+                    // Update nExtraNonce
+        static unsigned int nExtraNonce = 0;
+        IncrementExtraNonce(pblock, pindexPrev, nExtraNonce);
+
+
+        // Sets the version
+        pblock->SetAuxPow(new CAuxPow());
+
+        // Save
+        mapNewBlock[pblock->GetHash()] = pblock;
+
+        vNewBlockTemplate.push_back(std::move(pblocktemplate));
+    }
+    }
+
+    bool fNegative, fOverflow;
+    arith_uint256 hashTarget = arith_uint256().SetCompact(pblock->nBits, &fNegative, &fOverflow);
+    if (hashTarget == 0 || fNegative || fOverflow)
             throw std::runtime_error("block has invalid difficulty bits");
 
-        UniValue result(UniValue::VOBJ);
-        result.push_back(Pair("target", HexStr(BEGIN(hashTarget), END(hashTarget))));
-        result.push_back(Pair("hash", pblock->GetHash().GetHex()));
-        result.push_back(Pair("chainid", pblock->GetChainID()));
-        return result;
-    }
-    else
-    {
-        uint256 hash;
-        hash.SetHex(request.params[0].get_str());
-        std::vector<unsigned char> vchAuxPow = ParseHex(request.params[1].get_str());
-        CDataStream ss(vchAuxPow, SER_GETHASH, PROTOCOL_VERSION);
-        auto* pow = new CAuxPow();
-        ss >> *pow;
-        if (!mapNewBlock.count(hash))
-            return "stale-work";
+    UniValue result(UniValue::VOBJ);
+    result.push_back(Pair("hash", pblock->GetHash().GetHex()));
+    result.push_back(Pair("chainid", pblock->GetChainID()));
+    result.push_back(Pair("previousblockhash", pblock->hashPrevBlock.GetHex()));
+    result.push_back(Pair("coinbasevalue", (int64_t)pblock->vtx[0]->vout[0].nValue));
+    result.push_back(Pair("bits", strprintf("%08x", pblock->nBits)));
+    result.push_back(Pair("height", static_cast<int64_t> (pindexPrev->nHeight + 1)));
+    result.push_back(Pair("target", HexStr(BEGIN(hashTarget), END(hashTarget))));
 
-        CBlock* pblock = mapNewBlock[hash];
-        pblock->SetAuxPow(pow);
+    return result;
+}
 
-        bool fBlockPresent = false;
-        BlockMap::iterator mi = mapBlockIndex.find(hash);
-        if (mi != mapBlockIndex.end()) {
-            CBlockIndex *pindex = mi->second;
-            if (pindex->IsValid(BLOCK_VALID_SCRIPTS))
-                return "duplicate";
-            if (pindex->nStatus & BLOCK_FAILED_MASK)
-                return "duplicate-invalid";
-            fBlockPresent = true;
-        }
+static
+UniValue SumbitAuxBlock(const std::string& hashHex, const std::string& auxpowHex)
+{
+    AuxMiningCheck();
 
-        submitblock_StateCatcher sc(pblock->GetHash());
-        RegisterValidationInterface(&sc);
-        auto spblock = std::make_shared<CBlock>(*pblock);
-        bool fAccepted = ProcessNewBlock(Params(), spblock, true, nullptr);
-        UnregisterValidationInterface(&sc);
-        if (fBlockPresent) {
-            if (fAccepted && !sc.found) {
-                return "duplicate-inconclusive";
-            }
+    LOCK(cs_main);
+
+    uint256 hash;
+    hash.SetHex(hashHex);
+
+    if (!mapNewBlock.count(hash))
+        return ::error("stale-work");
+
+    CBlock* pblock = mapNewBlock[hash];
+
+    const std::vector<unsigned char> vchAuxPow = ParseHex(auxpowHex);
+    CDataStream ss(vchAuxPow, SER_GETHASH, PROTOCOL_VERSION);
+    auto* pow = new CAuxPow();
+    ss >> *pow;
+    pblock->SetAuxPow(pow);
+
+    bool fBlockPresent = false;
+    BlockMap::iterator mi = mapBlockIndex.find(hash);
+    if (mi != mapBlockIndex.end()) {
+        CBlockIndex *pindex = mi->second;
+        if (pindex->IsValid(BLOCK_VALID_SCRIPTS))
             return "duplicate";
-        }
-        if (!sc.found) {
-            return "inconclusive";
-        }
-        return BIP22ValidationResult(sc.state);
+        if (pindex->nStatus & BLOCK_FAILED_MASK)
+                return "duplicate-invalid";
+        fBlockPresent = true;
     }
+
+    submitblock_StateCatcher sc(pblock->GetHash());
+    RegisterValidationInterface(&sc);
+    auto spblock = std::make_shared<CBlock>(*pblock);
+    bool fAccepted = ProcessNewBlock(Params(), spblock, true, nullptr);
+    UnregisterValidationInterface(&sc);
+
+    if (fBlockPresent) {
+        if (fAccepted && !sc.found) {
+            return "duplicate-inconclusive";
+        }
+        return "duplicate";
+    
+    }
+    if (!sc.found) {
+            return "inconclusive";
+    }
+
+    UniValue result = BIP22ValidationResult(sc.state);
+    return result.isNull() ? true : result;
+}
+
+UniValue getauxblock(const JSONRPCRequest& request)
+{
+    if (request.fHelp || (request.params.size() != 0 && request.params.size() != 2))
+        throw std::runtime_error(
+            "getauxblock [<hash> <auxpow>]\n"
+            " create a new block"
+            "If <hash>, <auxpow> is not specified, returns a new block hash.\n"
+            "If <hash>, <auxpow> is specified, tries to solve the block based on "
+            "the aux proof of work and returns true if it was successful.");
+
+    /* Create a new block */
+    if (request.params.size() == 0)
+    {
+
+        static const CKeyID keyID = GetAuxpowMiningKey();
+        CScript scriptCoinbase = GetScriptForDestination(keyID);
+        return CreateAuxBlock(scriptCoinbase);
+    }
+
+    /* Submit a block instead.  Note that this need not lock cs_main,
+       since ProcessNewBlock below locks it instead.  */
+    assert(request.params.size() == 2);
+
+    return  SumbitAuxBlock(request.params[0].get_str(), 
+                            request.params[1].get_str());
+}
+
+UniValue createauxblock(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 1)
+        throw std::runtime_error(
+            "createauxblock (address)\n"
+            "\ncreate a new block and return information required to merge-mine it.\n"
+            "\nArguments:\n"
+            "1. address      (string, required) specify coinbase transaction payout address\n"
+            "\nResult:\n"
+            "{\n"
+            "  \"hash\"               (string) hash of the created block\n"
+            "  \"chainid\"            (numeric) chain ID for this block\n"
+            "  \"previousblockhash\"  (string) hash of the previous block\n"
+            "  \"coinbasevalue\"      (numeric) value of the block's coinbase\n"
+            "  \"bits\"               (string) compressed target of the block\n"
+            "  \"height\"             (numeric) height of the block\n"
+            "  \"_target\"            (string) target in reversed byte order, deprecated\n"
+            "}\n"
+            "\nExamples:\n"
+            + HelpExampleCli("createauxblock", "address")
+            + HelpExampleRpc("createauxblock", "")
+            );
+
+    // Check coinbase payout address
+    CScript scriptPubKey;
+    CBitcoinAddress coinbaseAddress(request.params[0].get_str());
+    if (!coinbaseAddress.IsValid())
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid coinbase payout address");
+    scriptPubKey = GetScriptForDestination(coinbaseAddress.Get());
+
+    return CreateAuxBlock(scriptPubKey);
+}
+
+UniValue submitauxblock(const JSONRPCRequest& request)
+{
+    if (request.fHelp || request.params.size() != 2)
+        throw std::runtime_error(
+            "submitauxblock (hash auxpow)\n"
+            "\nsubmit a solved auxpow for a previously block created by 'createauxblock'.\n"
+            "\nArguments:\n"
+            "1. hash      (string, required) hash of the block to submit\n"
+            "2. auxpow    (string, required) serialised auxpow found\n"
+            "\nResult:\n"
+            "xxxxx        (boolean) whether the submitted block was correct\n"
+            "\nExamples:\n"
+            + HelpExampleCli("submitauxblock", "\"hash\" \"serialised auxpow\"")
+            + HelpExampleRpc("submitauxblock", "")
+            );
+
+    return SumbitAuxBlock(request.params[0].get_str(), 
+                           request.params[1].get_str());
 }
 
 
@@ -1118,6 +1219,9 @@ static const CRPCCommand commands[] =
     { "mining",             "getblocktemplate",       &getblocktemplate,       true,  {"template_request"} },
     { "mining",             "submitblock",            &submitblock,            true,  {"hexdata","dummy"} },
     { "mining",             "getauxblock",            &getauxblock,            true,  {"hash","auxpow"} },
+    { "mining",             "createauxblock",         &createauxblock,         true,  {"address"} },
+    { "mining",             "submitauxblock",         &submitauxblock,         true,  {"hash","auxpow"} },
+
 
     { "generating",         "generatetoaddress",      &generatetoaddress,      true,  {"nblocks","address","maxtries"} },
 
